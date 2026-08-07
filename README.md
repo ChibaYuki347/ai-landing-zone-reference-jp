@@ -146,6 +146,10 @@ azd down --force --purge
 | Azure Firewall が `InternalServerError` で**3回連続失敗** | 構成側は全て正常と切り分け済み。`DEPLOY_AZURE_FIREWALL=false` で回避 |
 | リトライ時に `FirewallPolicyUpdateFailed` | `Failed` の Firewall を先に削除してから再実行 |
 | `az network firewall delete` が `EOFError` | `az resource delete --ids <id>` を使う |
+| `azd down --force --purge` が `CannotDeleteWorkspaceWhenLinkedToPrivateLinkScopes` (409) | 閉域構成では Log Analytics / App Insights が AMPLS に紐づく。**スコープリンクを解除してから再実行**（purge 段階の失敗なのでリソースは未削除） |
+| その後 `azd down` が `ResourceGroupDeletionBlocked`（**91 → 6 個で停止**） | RG 削除は依存関係を無視して並列削除するため。下記 2 つを個別に片付ける |
+| AI Search が `LockedSPLResourceFound` | Shared Private Link Resource が 4 件残存（接続先が消えて `Disconnected` でも削除をブロック）。SPL を全削除してから Search を削除 |
+| VNet が `InUseSubnetCannotBeDeleted`（`legionservicelink`） | ACA 環境の孤児 Service Association Link。委任と SAL が相互ロックし **手動解除は一切不可**（SAL の削除は `Microsoft.App` RP のみ許可）。30 分〜数時間で自動回収されるので待って再実行 |
 
 詳細な切り分け手順とコマンドは
 **[デプロイガイド - Japan East の既知の制約](docs/06-deployment-guide.md)** に記載しています。

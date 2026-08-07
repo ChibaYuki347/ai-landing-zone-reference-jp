@@ -670,6 +670,180 @@ azd down --force --purge
 **`--purge` は必須です。** これがないと Key Vault / App Configuration / Cognitive Services が
 論理削除状態で残り、同じ名前で再デプロイできません。
 
+### `CannotDeleteWorkspaceWhenLinkedToPrivateLinkScopes` で失敗する場合（閉域構成では必ず発生）
+
+閉域構成では Log Analytics と Application Insights が
+**Azure Monitor Private Link Scope (AMPLS)** に紐づけられるため、
+`azd down --force --purge` が purge 段階で 409 エラーになります。
+
+```
+ERROR: deleting infrastructure: ... purging log analytics workspace ...
+RESPONSE 409: 409 Conflict
+ERROR CODE: CannotDeleteWorkspaceWhenLinkedToPrivateLinkScopes
+```
+
+> [!IMPORTANT]
+> このエラーは **purge の段階で発生するため、リソースは1つも削除されていません。**
+> 「途中まで消えた」状態ではないので、下記の対処後に `azd down` をそのまま再実行すれば済みます。
+
+**対処:** AMPLS のスコープリンクを先に解除してから `azd down` を再実行します。
+
+```powershell
+$rg   = azd env get-value AZURE_RESOURCE_GROUP
+$sub  = az account show --query id -o tsv
+$pls  = az resource list -g $rg --resource-type "microsoft.insights/privateLinkScopes" --query "[0].name" -o tsv
+
+# 1. AMPLS に紐づいているリソースを確認
+$uri = "https://management.azure.com/subscriptions/$sub/resourceGroups/$rg/providers/microsoft.insights/privatelinkscopes/$pls/scopedResources?api-version=2019-10-17-preview"
+$sr = az rest --method get --url $uri -o json | ConvertFrom-Json
+$sr.value | ForEach-Object { "$($_.name) -> $(($_.properties.linkedResourceId -split '/')[-1])" }
+# 例: appi-xxxxx -> appi-xxxxx
+#     log-xxxxx  -> log-xxxxx
+
+# 2. スコープリンクを解除
+foreach ($s in $sr.value) {
+    az rest --method delete --url "https://management.azure.com$($s.id)?api-version=2019-10-17-preview"
+}
+
+# 3. 再実行
+cd infra-upstream
+azd down --force --purge
+```
+
+> [!NOTE]
+> `az monitor private-link-scope scoped-resource delete` でも同じことができますが、
+> `application-insights` 拡張の対話インストールプロンプトで
+> `EOFError` になることがあるため、上記の `az rest` を推奨します。
+
+### `ResourceGroupDeletionBlocked` で失敗する場合（閉域構成では必ず発生）
+
+AMPLS を解除して `azd down` を再実行すると、purge は通りますが
+今度は **リソースグループの削除**で失敗します。
+
+```
+ERROR: deleting resource group 'rg-xxxxx': DELETE .../resourcegroups/rg-xxxxx
+ERROR CODE: ResourceGroupDeletionBlocked
+Message: Deletion of resource group 'rg-xxxxx' failed as resources with identifiers
+'...' could not be deleted.
+```
+
+**原因:** リソースグループの削除は**依存関係を無視して並列削除**するため、
+削除順序が必要なリソースが残ります。実測では **91 → 6 個**まで削除されて停止しました。
+
+| 残ったリソース | ブロッカー |
+|---|---|
+| AI Search | `LockedSPLResourceFound` — Shared Private Link Resource (SPL) が 4 件残存 |
+| VNet | `InUseSubnetCannotBeDeleted` — `agent-subnet` の `serviceAssociationLinks/legionservicelink` |
+| NAT Gateway / Public IP / Route Table / NSG | VNet が消えれば連鎖的に解決 |
+
+#### 対処 1: AI Search の Shared Private Link Resource を先に削除する
+
+閉域構成では Search が Blob / Foundry / OpenAI へ SPL を張ります。
+接続先が先に消えると SPL は `Disconnected` になりますが、**残っている限り Search は削除できません。**
+
+```powershell
+$rg   = azd env get-value AZURE_RESOURCE_GROUP
+$srch = az resource list -g $rg --resource-type "Microsoft.Search/searchServices" --query "[0].name" -o tsv
+
+# 1. SPL の一覧
+$spl = az search shared-private-link-resource list --service-name $srch -g $rg -o json | ConvertFrom-Json
+$spl | ForEach-Object { "$($_.name) -> $($_.properties.status)" }
+# 例: spl-...-blob-0                      -> Disconnected
+#     spl-...-openai_account-1            -> Disconnected
+#     spl-...-foundry_account-1           -> Disconnected
+#     spl-...-cognitiveservices_account-1 -> Disconnected
+
+# 2. すべて削除（1 件あたり 1〜2 分）
+foreach ($s in $spl) {
+    az search shared-private-link-resource delete `
+        --service-name $srch -g $rg --name $s.name --yes
+}
+
+# 3. Search 本体を削除
+az resource delete --ids (az resource show -g $rg -n $srch `
+    --resource-type "Microsoft.Search/searchServices" --query id -o tsv)
+```
+
+#### 対処 2: `agent-subnet` の孤児 Service Association Link
+
+Container Apps 環境をサブネット委任で使うと、Azure が
+`serviceAssociationLinks/legionservicelink` を自動作成します。
+ACA 環境を削除してもこの SAL は**非同期にクリーンアップ**されるため、
+削除直後は VNet が消せません。
+
+```
+(InUseSubnetCannotBeDeleted) Subnet agent-subnet is in use by
+.../subnets/agent-subnet/serviceAssociationLinks/legionservicelink
+```
+
+> [!WARNING]
+> **手動では解除できません。** 以下はすべて失敗します。
+>
+> | 試みたこと | 結果 |
+> |---|---|
+> | `az network vnet subnet update --remove delegations` | `SubnetMissingRequiredDelegation` — SAL があるので委任を外せない |
+> | `az network vnet subnet delete` | `InUseSubnetCannotBeDeleted` |
+> | `az rest --method delete` で SAL を直接削除 | `UnauthorizedClientApplication` — SAL の削除は `Microsoft.App` RP のみに許可 |
+>
+> 委任と SAL が相互にロックしあうデッドロック状態です。
+
+**対処: 時間をおいて再実行します。**
+`Microsoft.App` RP がバックグラウンドで SAL を回収するため、
+通常 **30 分〜数時間**で自動的に消えます。
+
+```powershell
+# SAL が残っているか確認
+$vnet = az resource list -g $rg --resource-type "Microsoft.Network/virtualNetworks" --query "[0].name" -o tsv
+$sub  = az account show --query id -o tsv
+$url  = "https://management.azure.com/subscriptions/$sub/resourceGroups/$rg/providers/Microsoft.Network/virtualNetworks/$vnet/subnets/agent-subnet?api-version=2023-09-01"
+(az rest --method get --url $url -o json | ConvertFrom-Json).properties.serviceAssociationLinks
+
+# 消えていたら RG ごと削除
+az group delete -n $rg --yes --no-wait
+```
+
+> [!TIP]
+> **RG を残したまま放置してもコストはほぼ発生しません。**
+> この段階で残るのは VNet / NSG / Route Table（無料）と
+> NAT Gateway + Public IP（合計 約 $35/月）のみです。
+> 急ぐ場合は NAT Gateway だけ先に削除しておけば、実質的な課金は止まります。
+>
+> ```powershell
+> az network nat gateway delete -g $rg -n (az resource list -g $rg `
+>     --resource-type "Microsoft.Network/natGateways" --query "[0].name" -o tsv)
+> ```
+
+#### 推奨: 最初から順序どおりに削除する
+
+`azd down` を実行する前に、以下の順で片付けておくと 1 回で完了します。
+
+```powershell
+$rg = azd env get-value AZURE_RESOURCE_GROUP
+
+# 1. AMPLS のスコープリンクを解除（前節）
+# 2. Search の SPL を削除 → Search を削除（対処 1）
+# 3. Container App / ACA 環境を先に削除して SAL の回収を始めさせる
+az containerapp env list -g $rg --query "[].name" -o tsv | ForEach-Object {
+    az containerapp env delete -g $rg -n $_ --yes
+}
+# 4. 30 分ほどおいてから
+azd down --force --purge
+```
+
+### 削除の完了確認
+
+`azd down` は約 10〜20 分かかります。完了後に確認します。
+
+```powershell
+# リソースグループが消えているか
+az group exists -n rg-<env-name>     # false になれば完了
+
+# 論理削除が残っていないか
+az keyvault list-deleted --query "[].name" -o tsv
+az appconfig list-deleted --query "[].name" -o tsv
+az cognitiveservices account list-deleted --query "[].name" -o tsv
+```
+
 ### 論理削除が残ってしまった場合
 
 ```powershell
@@ -694,6 +868,10 @@ az cognitiveservices account purge --name <name> --location <location> --resourc
 |---|---|
 | `InsufficientResourcesAvailable`（AI Search） | リージョンの容量不足。`azd env set AZURE_SEARCH_LOCATION eastus` で別リージョンへ |
 | `NameUnavailable: appcs-... is already in use` | 論理削除の残骸。上記の purge 手順を実行 |
+| `azd down` が `CannotDeleteWorkspaceWhenLinkedToPrivateLinkScopes` (409) | 閉域構成では Log Analytics / App Insights が AMPLS に紐づく。**purge 段階の失敗なのでリソースは未削除。** [削除](#削除)節の手順でスコープリンクを解除してから再実行 |
+| `azd down` が `ResourceGroupDeletionBlocked` | RG 削除は並列削除なので依存関係で止まる。実測 91 → 6 個で停止。[削除](#resourcegroupdeletionblocked-で失敗する場合閉域構成では必ず発生)節を参照 |
+| Search が `LockedSPLResourceFound` で削除できない | Shared Private Link Resource が残存。`az search shared-private-link-resource delete` で 4 件すべて削除してから Search を削除 |
+| VNet が `InUseSubnetCannotBeDeleted`（`legionservicelink`） | ACA 環境の孤児 Service Association Link。**手動解除は不可**（委任と SAL が相互ロック）。30 分〜数時間で自動回収されるので待って再実行 |
 | `Login expired` がデプロイ中に発生 | `azd auth login` 後に `azd provision` を再実行。ARM デプロイはサーバ側で継続中 |
 | Container App が 502 | イメージ pull 失敗。`az containerapp logs show -g $rg -n <ca>`。Firewall の `AllowMicrosoftContainerRegistry` ルールを確認 |
 | Jumpbox の CSE が失敗 | ポータル → VM → 拡張機能 → `AzureCustomScriptExtension` でエラー確認。Firewall の FQDN 許可リスト不足が多い |
