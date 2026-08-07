@@ -6,6 +6,12 @@ Azure にデプロイする手順です。
 > 📖 上流の詳細ランブックは [`infra-upstream/docs/runbook-standalone.md`](../infra-upstream/docs/runbook-standalone.md)（英語）にあります。
 > 本ドキュメントはそれを日本語で要約し、日本の利用者向けの補足を加えたものです。
 
+> [!NOTE]
+> **本ガイドは 2026年8月に Japan East で実際にデプロイして検証済みです。**
+> 遭遇した実障害（azd の認証エラー、ACR Task Agent Pool の非対応、Azure Firewall の
+> `InternalServerError`）と、その切り分け・回避手順をすべて反映しています。
+> 実測値と Zero Trust の実証結果は [README の「実機検証済み」](../README.md#実機検証済み2026年8月--japan-east) を参照してください。
+
 ---
 
 ## 目次
@@ -14,6 +20,7 @@ Azure にデプロイする手順です。
 - [デプロイ構成の選択](#デプロイ構成の選択)
 - [最小構成での検証](#最小構成での検証)
 - [閉域構成（Zero Trust）](#閉域構成zero-trust)
+  - [閉域構成での動作確認](#閉域構成での動作確認) — 外部からの遮断・VNet 内からの到達・マネージド ID でのモデル呼び出し
 - [既存 ALZ への統合](#既存-alz-への統合)
 - [モデルデプロイのカスタマイズ](#モデルデプロイのカスタマイズ)
 - [デプロイ後の確認](#デプロイ後の確認)
@@ -21,6 +28,7 @@ Azure にデプロイする手順です。
 - [削除](#削除)
 - [トラブルシューティング](#トラブルシューティング)
 - [主要な環境変数リファレンス](#主要な環境変数リファレンス)
+
 
 ---
 
@@ -74,10 +82,28 @@ az vm list-usage --location swedencentral --query "[?contains(name.value,'standa
 |---|---|
 | **Sweden Central** ⭐ | 最新モデルの提供が早い。AI Landing Zone の検証実績が多い |
 | **East US 2** ⭐ | 同上。米国データレジデンシが必要な場合 |
-| Japan East | 日本国内レジデンシが必要な場合。最新モデルは遅れることがある |
+| Japan East | 日本国内レジデンシが必要な場合。**下記の制約あり** |
 | West Europe | EU データレジデンシ |
 
 > モデルとリージョンの対応: https://learn.microsoft.com/azure/ai-foundry/openai/concepts/models
+
+#### Japan East の既知の制約（2026年8月 実機検証）
+
+本リポジトリでフル構成を japaneast にデプロイした際に確認した事象です。
+
+| 事象 | 症状 | 回避策 |
+|---|---|---|
+| **ACR Task Agent Pool 非対応** | `LocationNotAvailableForResourceType: Microsoft.ContainerRegistry/registries/agentPools` でバリデーション失敗 | `azd env set DEPLOY_ACR_TASK_AGENT_POOL false`（上流の既定値も `false`） |
+| **Azure Firewall の作成失敗** | `InternalServerError: An error occurred.` — **3回連続で再現**。サブネット `/26`・Standard Public IP・Policy `Succeeded` と構成は正常なのでプラットフォーム側の問題 | `azd env set DEPLOY_AZURE_FIREWALL false`、または Firewall だけ別リージョンに置く |
+| **Cosmos DB の可用性ゾーン非対応** | プリフライトが `COSMOS_NO_AZ` を WARN | ゾーン冗長が必須なら別リージョンへ |
+
+`agentPools` が利用できるリージョン（2026年8月時点）:
+`eastus, westeurope, westus2, southcentralus, australiaeast, canadacentral, centralus, eastasia, eastus2, northeurope, francecentral, switzerlandnorth, swedencentral, jioindiawest, jioindiacentral`
+
+> **Firewall なしでも Zero Trust は成立します。** NAT Gateway による固定送信 IP、NSG、
+> Private Endpoint、パブリックアクセス無効化は維持されます。失われるのは
+> **送信 FQDN のホワイトリスト制御**のみです。規制要件で明示的に求められる場合のみ
+> Firewall を有効化し、そのリージョンで作成できることを事前に確認してください。
 
 **リージョンを分けることもできます:**
 
@@ -93,6 +119,24 @@ azd env set AZURE_SEARCH_LOCATION eastus          # Search の容量不足回避
 az login
 azd auth login
 az account set --subscription '<subscription-id-or-name>'
+```
+
+#### `azd` が `AADSTS9002313` で認証に失敗する場合
+
+`azd auth login` が成功しても `azd up` の途中で
+`ERROR: Reauthentication required. / AADSTS9002313: Invalid request` が出ることがあります。
+azd 独自のトークンキャッシュが壊れている状態です。az CLI の認証情報を使うよう切り替えてください。
+
+```powershell
+azd config set auth.useAzCliAuth true
+azd auth token   # トークンが取得できれば OK
+```
+
+ブラウザが自動で開かない環境ではデバイスコードを使います。
+
+```powershell
+az login --use-device-code
+azd auth login --use-device-code
 ```
 
 ---
@@ -225,26 +269,173 @@ azd env set PUBLIC_INGRESS '{"enabled": true}'
 
 ### 閉域構成での動作確認
 
-Container App は自分の PC からは到達できません。Jumpbox 経由で確認します。
+閉域構成では、**外から遮断され、中から到達できる**ことの両方を確認します。
+片方だけでは「閉域になっている」証明になりません。
+
+> [!IMPORTANT]
+> `az vm run-command invoke --scripts "..."` に**スクリプトを直接埋め込むのは避けてください。**
+> PowerShell の文字列補間と cmd.exe のクォート解釈が衝突して構文エラーになり、
+> さらに**日本語を含めると VM 側で文字化けしてパースエラー**になります
+> （`Unexpected token 'a,S=^?"^?SY)'` のような症状）。
+> **ASCII のみの .ps1 ファイルを作り、`--scripts "@ファイルパス"` で渡してください。**
+
+#### 1. 外部から遮断されていることを確認
+
+自分の PC（VNet 外）から実行します。
 
 ```powershell
 $rg = azd env get-value AZURE_RESOURCE_GROUP
-$vmName = az vm list -g $rg --query "[0].name" -o tsv
-$ca = az containerapp list -g $rg --query "[0].name" -o tsv
-$fqdn = az containerapp show -g $rg -n $ca --query "properties.configuration.ingress.fqdn" -o tsv
+$acct = az cognitiveservices account list -g $rg --query "[0].name" -o tsv
 
-$script = @"
-try {
-    `$r = Invoke-WebRequest -Uri 'http://$fqdn' -UseBasicParsing -TimeoutSec 30
-    Write-Host ('Status=' + `$r.StatusCode + ' Len=' + `$r.Content.Length)
-} catch { Write-Host ('ERROR: ' + `$_.Exception.Message) }
-"@
+# Foundry のデータプレーンを叩く
+$tok = az account get-access-token --resource https://cognitiveservices.azure.com --query accessToken -o tsv
+$body = @{ messages = @(@{ role='user'; content='hi' }); max_completion_tokens = 16 } | ConvertTo-Json -Depth 5
+$uri = "https://$acct.cognitiveservices.azure.com/openai/deployments/chat/chat/completions?api-version=2025-01-01-preview"
 
-az vm run-command invoke -g $rg -n $vmName --command-id RunPowerShellScript `
-    --scripts $script --query "value[0].message" -o tsv
+$r = Invoke-WebRequest -Uri $uri -Method POST -Headers @{ Authorization = "Bearer $tok" } `
+       -ContentType "application/json" -Body $body -SkipHttpErrorCheck
+"HTTP $($r.StatusCode)"
+$r.Content
 ```
 
-`Status=200` が返れば成功です。
+**期待される結果:**
+
+```
+HTTP 403
+{"error":{"code":"403","message": "Public access is disabled. Please configure private endpoint."}}
+```
+
+Key Vault も同様に拒否されます。
+
+```powershell
+az keyvault secret list --vault-name (az keyvault list -g $rg --query "[0].name" -o tsv)
+# ERROR: (Forbidden) Public network access is disabled and request is not from
+#        a trusted service nor via an approved private link.
+```
+
+> [!TIP]
+> ブラウザや `Invoke-WebRequest` でエンドポイントのルート URL（`https://<name>.cognitiveservices.azure.com/`）
+> を叩くと **HTTP 200 が返ることがあります**が、これは Azure のフロントエンドが TLS 終端で返しているだけで、
+> データプレーンには到達していません。**必ず実際の API パスで検証してください。**
+
+#### 2. VNet 内から到達できることを確認
+
+Jumpbox から実行します。まず ASCII のみのスクリプトファイルを作ります。
+
+```powershell
+$rg     = azd env get-value AZURE_RESOURCE_GROUP
+$vmName = az vm list -g $rg --query "[0].name" -o tsv
+$acct   = az cognitiveservices account list -g $rg --query "[0].name" -o tsv
+$ca     = az containerapp list -g $rg --query "[0].name" -o tsv
+$fqdn   = az containerapp show -g $rg -n $ca --query "properties.configuration.ingress.fqdn" -o tsv
+$kv     = az keyvault list -g $rg --query "[0].name" -o tsv
+
+@"
+`$ErrorActionPreference = 'Continue'
+function Test-Url(`$n, `$u) {
+    try { Write-Output (`$n + '=' + [int](Invoke-WebRequest -Uri `$u -TimeoutSec 30 -UseBasicParsing).StatusCode) }
+    catch { if (`$_.Exception.Response) { Write-Output (`$n + '=' + [int]`$_.Exception.Response.StatusCode) }
+            else { Write-Output (`$n + '=UNREACHABLE') } }
+}
+Write-Output '--- HTTP ---'
+Test-Url 'ACA'     'https://$fqdn/'
+Test-Url 'FOUNDRY' 'https://$acct.cognitiveservices.azure.com/'
+Write-Output '--- DNS (expect private IPs) ---'
+foreach (`$h in @('$acct.cognitiveservices.azure.com', '$fqdn', '$kv.vault.azure.net')) {
+    `$ips = (Resolve-DnsName `$h -Type A -EA SilentlyContinue | Where-Object { `$_.IPAddress }).IPAddress
+    Write-Output (`$h + ' -> ' + (`$ips -join ', '))
+}
+Write-Output '--- Outbound IP (expect NAT Gateway) ---'
+Write-Output (Invoke-RestMethod -Uri 'https://api.ipify.org' -TimeoutSec 20)
+"@ | Set-Content -Path .\check.ps1 -Encoding ascii
+
+$out = az vm run-command invoke -g $rg -n $vmName --command-id RunPowerShellScript `
+         --scripts "@.\check.ps1" -o json | ConvertFrom-Json
+$out.value | ForEach-Object { $_.message }
+```
+
+**期待される結果:**
+
+```
+--- HTTP ---
+ACA=200
+FOUNDRY=200
+--- DNS (expect private IPs) ---
+aif-xxxxx.cognitiveservices.azure.com -> 192.168.2.31
+ca-xxxxx.<env>.japaneast.azurecontainerapps.io -> 192.168.2.11
+kv-xxxxx.vault.azure.net -> 192.168.2.9
+--- Outbound IP (expect NAT Gateway) ---
+13.78.18.18
+```
+
+**確認ポイント:**
+
+| 項目 | 意味 |
+|---|---|
+| `FOUNDRY=200`（外部からは 403） | Private Endpoint 経由でのみ到達できている |
+| DNS が `192.168.2.x` を返す | Private DNS Zone が VNet にリンクされ、PE の内部 IP を解決している |
+| 送信 IP が NAT Gateway の Public IP | 送信 IP が固定され、相手側でホワイトリスト化できる |
+
+送信 IP は NAT Gateway の Public IP と一致するはずです。
+
+```powershell
+$ng = az network nat gateway list -g $rg --query "[0].name" -o tsv
+$pipId = az network nat gateway show -g $rg -n $ng --query "publicIpAddresses[0].id" -o tsv
+az network public-ip show --ids $pipId --query ipAddress -o tsv
+```
+
+#### 3. マネージド ID でモデルを実呼び出しする（最終確認）
+
+**API キーを一切使わずに**モデルが応答することを確認します。これが通れば、
+Private Endpoint + Private DNS + Entra ID 認証 + RBAC の一式が機能している証明になります。
+
+Jumpbox のマネージド ID には `Cognitive Services OpenAI User` が付与済みです。
+
+```powershell
+@"
+`$imds = 'http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https%3A%2F%2Fcognitiveservices.azure.com'
+`$tok = (Invoke-RestMethod -Uri `$imds -Headers @{ Metadata = 'true' } -TimeoutSec 30).access_token
+`$body = @{ messages = @(@{ role = 'user'; content = 'Reply with exactly: AILZ-OK' }); max_completion_tokens = 512 } | ConvertTo-Json -Depth 6
+`$r = Invoke-RestMethod -Uri 'https://$acct.cognitiveservices.azure.com/openai/deployments/chat/chat/completions?api-version=2025-01-01-preview' ``
+       -Method POST -Headers @{ Authorization = 'Bearer ' + `$tok } -ContentType 'application/json' -Body `$body -TimeoutSec 90
+Write-Output ('content       : ' + `$r.choices[0].message.content)
+Write-Output ('finish_reason : ' + `$r.choices[0].finish_reason)
+Write-Output ('model         : ' + `$r.model)
+"@ | Set-Content -Path .\model-call.ps1 -Encoding ascii
+
+$out = az vm run-command invoke -g $rg -n $vmName --command-id RunPowerShellScript `
+         --scripts "@.\model-call.ps1" -o json | ConvertFrom-Json
+$out.value | ForEach-Object { $_.message }
+```
+
+**期待される結果:**
+
+```
+content       : AILZ-OK
+finish_reason : stop
+model         : gpt-5-nano-2025-08-07
+```
+
+> [!NOTE]
+> `gpt-5-nano` などの推論モデルは**推論トークンを消費する**ため、
+> `max_completion_tokens` が小さすぎると `finish_reason: length` で
+> **`content` が空文字**になります（上の例では推論に 64 トークン使用）。
+> 動作確認時は **512 以上**を指定してください。
+
+#### 4. Container App の到達性についての注意
+
+ACA Environment が `internal: true` の場合、Container App 側の
+`ingress.external` が `true` でも **インターネットからは到達できません。**
+`external` は「ACA Environment 内での外部公開」を意味するだけです。
+
+```powershell
+# ACA Environment が internal かどうかを確認する
+az containerapp env show -g $rg -n (az containerapp env list -g $rg --query "[0].name" -o tsv) `
+  --query "{internal:properties.vnetConfiguration.internal, staticIp:properties.staticIp}" -o json
+```
+
+`internal: true` が返れば閉域です。同梱の `scripts/Test-Deployment.ps1` は
+この判定を行い、「VNet 内のみ（ACA Environment が internal）」と表示します。
 
 ### Bastion 経由での RDP
 
@@ -415,6 +606,20 @@ azd env get-values
 > 実際の料金はリージョン、為替、取り込みログ量、割引契約によって変動します。
 > 正確な見積もりは [Azure 料金計算ツール](https://azure.microsoft.com/pricing/calculator/) を使用してください。
 
+#### 実機検証時の構成（Japan East / 2026年8月）
+
+本リポジトリの検証では、Japan East で Azure Firewall が作成できなかったため
+（[Japan East の既知の制約](#japan-east-の既知の制約2026年8月-実機検証)参照）
+**Firewall なしの「ZT フル相当」= 月 ~US$785** で運用しました。
+
+| 項目 | 実測値 |
+|---|---|
+| 作成リソース数 | 91（Private Endpoint 13 / Private DNS Zone 15） |
+| デプロイ時間 | 20 分 39 秒（差分）／初回フル約 70 分 |
+| 該当コスト列 | **Zero Trust（~US$785）** — Bastion / Jumpbox / NAT Gateway 込み、Firewall なし |
+
+Firewall なしでも受信閉域化・PaaS のパブリック無効化・送信 IP 固定は維持されます。
+
 ### モデルの利用料（別途）
 
 インフラとは別に、トークン消費に応じた課金が発生します。
@@ -496,12 +701,81 @@ az cognitiveservices account purge --name <name> --location <location> --resourc
 | モデルクォータ不足でプリフライト失敗 | ポータルのクォータ画面で増枠申請、または `capacity` を下げる |
 | プリフライトを一時的に無視したい | `$env:PREFLIGHT_SKIP = 'true'`（非推奨） |
 | ARM テンプレートサイズ超過 | 不要な `DEPLOY_*` を `false` に。`scripts/Measure-MainJsonSize.ps1` で確認（警告 3.5MB / 失敗 4.7MB） |
+| `AADSTS9002313` で azd が認証失敗 | azd のトークンキャッシュ破損。`azd config set auth.useAzCliAuth true` で az CLI 認証に切り替え |
+| `LocationNotAvailableForResourceType: .../agentPools` | ACR Task Agent Pool が非対応リージョン。`azd env set DEPLOY_ACR_TASK_AGENT_POOL false` |
+| Azure Firewall が `InternalServerError` | プラットフォーム側の障害。下記「Azure Firewall が作成できない」を参照 |
+| `FirewallPolicyUpdateFailed: ... Failed with 1 faulted referenced firewalls` | `Failed` 状態の Firewall が Policy 更新をブロック。Firewall を削除してから再実行 |
+| `az network firewall ...` が `EOF when reading a line` で異常終了 | 拡張の対話インストールプロンプト。`az extension add -n azure-firewall -y` を先に実行するか、`az resource delete --ids <resourceId>` を使う |
+| `PolicyDeployment_*` が失敗している | サブスクリプションのガバナンスポリシー（deployIfNotExists）由来。AI Landing Zone のデプロイとは無関係で、無視して問題ない |
+| `az vm run-command` が `Unexpected token` / 文字化けで失敗 | `--scripts` にスクリプトを直接埋め込むと、クォート解釈の衝突と日本語の文字化けで壊れる。**ASCII のみの .ps1 を作り `--scripts "@ファイルパス"`** で渡す |
+| `az ... --query "length(@)"` が `-o was unexpected at this time.` | `(` `)` が cmd.exe に解釈される。`-o json \| ConvertFrom-Json` してから `.Count` を取る |
+| `invalid jmespath_type value: '[].{???:name,...}'` | JMESPath に日本語を書くと Windows のコードページで壊れる。**JMESPath は ASCII のみ**にし、表示のローカライズは `Format-Table @{L='名前';E={$_.name}}` で行う |
+| モデルの応答 `content` が空で `finish_reason: length` | 推論モデル（gpt-5 系）が推論トークンを使い切っている。`max_completion_tokens` を 512 以上に |
+| 外部から PaaS のルート URL に HTTP 200 が返る | Azure のフロントエンドが TLS 終端で返しているだけ。閉域の確認は**実際の API パス**で行う（正しく閉じていれば 403） |
+| Container App が `ingress.external=true` なのに外から繋がらない | 正常。ACA Environment が `internal: true` なら `external` は「環境内での公開」を意味し、VNet 内からのみ到達可能 |
+
+### Azure Firewall が作成できない
+
+`Microsoft.Network/azureFirewalls/write` が `InternalServerError: An error occurred.` で
+失敗するケースがあります。**japaneast では 3 回連続で再現しました（2026年8月）。**
+
+まず構成側の問題を切り分けます。すべて正常なら、プラットフォーム側の問題です。
+
+```powershell
+$rg = 'rg-<env-name>'
+
+# AzureFirewallSubnet が /26 以上か
+az network vnet show -g $rg -n <vnet> --query "subnets[?name=='AzureFirewallSubnet'].addressPrefix" -o tsv
+
+# Public IP が Standard SKU か
+az network public-ip list -g $rg --query "[?starts_with(name,'pip-afw')].{Sku:sku.name, State:provisioningState}" -o table
+
+# Firewall Policy が Succeeded か
+az resource show --ids "/subscriptions/<sub>/resourceGroups/$rg/providers/Microsoft.Network/firewallPolicies/<policy>" --query "properties.provisioningState" -o tsv
+```
+
+**リトライする場合** — `Failed` 状態の Firewall は必ず削除してから再実行します。
+残したまま `azd up` すると `FirewallPolicyUpdateFailed` になります。
+
+```powershell
+az resource delete --ids "/subscriptions/<sub>/resourceGroups/$rg/providers/Microsoft.Network/azureFirewalls/<fw-name>"
+azd provision --no-prompt
+```
+
+**あきらめる場合** — Firewall を外しても Zero Trust の大半は維持されます。
+
+```powershell
+az resource delete --ids ".../azureFirewalls/<fw-name>"
+azd env set DEPLOY_AZURE_FIREWALL false
+azd up --no-prompt
+```
+
+| 統制 | Firewall あり | Firewall なし |
+|---|:---:|:---:|
+| Private Endpoint による受信閉域化 | ✅ | ✅ |
+| PaaS のパブリックアクセス無効化 | ✅ | ✅ |
+| NSG によるサブネット間制御 | ✅ | ✅ |
+| NAT Gateway による送信 IP 固定 | ✅ | ✅ |
+| **送信 FQDN のホワイトリスト制御** | ✅ | ❌ |
+| 送信トラフィックの L7 ログ | ✅ | ❌ |
+| 月額コスト | +~900 USD | — |
+
+> 送信 FQDN 制御が規制要件で明示されている場合のみ Firewall が必須です。
+> その場合は swedencentral / eastus2 など、作成実績のあるリージョンを選んでください。
 
 ### デプロイ状況の確認
 
 ```powershell
 az deployment sub list --query "[0].{name:name, state:properties.provisioningState, ts:properties.timestamp}" -o table
 az deployment group list -g $rg --query "[?properties.provisioningState=='Failed'].{name:name, error:properties.error.message}" -o json
+
+# 失敗した個別リソースまで掘る
+az deployment operation group list -g $rg -n <deployment-name> `
+  --query "[?properties.provisioningState=='Failed'].{Res:properties.targetResource.resourceName, Code:properties.statusMessage.error.code, Msg:properties.statusMessage.error.message}" -o json
+
+# リソースの現在状態を一覧（Succeeded 以外を洗い出す）
+$all = az resource list -g $rg -o json | ConvertFrom-Json
+$all | Where-Object { $_.provisioningState -ne 'Succeeded' } | Select-Object name, type, provisioningState
 ```
 
 ---

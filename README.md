@@ -104,6 +104,60 @@ azd down --force --purge
 
 ---
 
+## 実機検証済み（2026年8月 / Japan East）
+
+このリポジトリの手順・スクリプトは**実際に Azure へデプロイして検証済み**です。
+机上の構成ではありません。
+
+### デプロイ実績
+
+| 項目 | 実測値 |
+|---|---|
+| リージョン | Japan East |
+| プリセット | `full`（Azure Firewall / ACR Task Agent Pool は後述の理由で無効） |
+| 作成リソース数 | **91**（すべて `Succeeded`） |
+| Private Endpoint | 13 |
+| Private DNS Zone | 15（VNet リンク 15） |
+| デプロイ時間 | **20 分 39 秒**（差分デプロイ）／ 初回フルは約 70 分 |
+| モデル | `gpt-5-nano` (GlobalStandard 40) / `text-embedding-3-large` (Standard 10) |
+
+### Zero Trust の実証結果
+
+「閉域構成です」と書くだけでなく、**実際に外から遮断され、中から到達できること**を確認しています。
+
+| 検証項目 | 結果 |
+|---|---|
+| **外部 PC** から Foundry のデータプレーン呼び出し | `HTTP 403` — `Public access is disabled. Please configure private endpoint.` |
+| **外部 PC** から Key Vault のシークレット一覧 | `Forbidden` — `Public network access is disabled and request is not from a trusted service nor via an approved private link.` |
+| **VNet 内 Jumpbox** から Foundry / Container App | `HTTP 200` |
+| **VNet 内 Jumpbox** の DNS 解決 | Foundry → `192.168.2.31` / Key Vault → `192.168.2.9` / Search → `192.168.2.7` / ACR → `192.168.2.13` / Blob → `192.168.2.4`（すべて PE サブネットの内部 IP） |
+| **VNet 内 Jumpbox** の送信 IP | `13.78.18.18` = NAT Gateway の Public IP（送信 IP が固定されている） |
+| **マネージド ID** でのモデル実呼び出し | `HTTP 200` / 応答 `AILZ-OK` / model `gpt-5-nano-2025-08-07`（**API キーを一切使わずに成功**） |
+
+つまり、**Private Endpoint + Private DNS + マネージド ID + NAT Gateway** の一式が
+設計どおりに機能していることが実測で確認できています。
+
+### 遭遇した実際の障害（すべてドキュメント化済み）
+
+| 事象 | 対処 |
+|---|---|
+| `azd up` が `AADSTS9002313: Invalid request` で失敗 | `azd config set auth.useAzCliAuth true` |
+| ACR Task Agent Pool が `LocationNotAvailableForResourceType` | Japan East 非対応。`DEPLOY_ACR_TASK_AGENT_POOL=false`（上流の既定値も `false`） |
+| Azure Firewall が `InternalServerError` で**3回連続失敗** | 構成側は全て正常と切り分け済み。`DEPLOY_AZURE_FIREWALL=false` で回避 |
+| リトライ時に `FirewallPolicyUpdateFailed` | `Failed` の Firewall を先に削除してから再実行 |
+| `az network firewall delete` が `EOFError` | `az resource delete --ids <id>` を使う |
+
+詳細な切り分け手順とコマンドは
+**[デプロイガイド - Japan East の既知の制約](docs/06-deployment-guide.md)** に記載しています。
+
+> [!NOTE]
+> `presets/full.env` は上記の実機検証を反映して **Japan East / Firewall 無効** を既定にしています。
+> Firewall を使う場合は Sweden Central など別リージョンを推奨します。
+> **Firewall がなくても** PE による受信閉域化・PaaS のパブリック無効化・NSG・NAT Gateway による
+> 送信 IP 固定は維持されます。失われるのは送信 FQDN ホワイトリストと L7 送信ログのみです。
+
+---
+
 ## リポジトリ構成
 
 ```
