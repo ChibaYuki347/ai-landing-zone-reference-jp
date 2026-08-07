@@ -1,0 +1,60 @@
+# Azure Developer CLI
+.azure/
+.azure*/
+
+# 環境変数・シークレット
+*.env
+!presets/*.env
+.env.local
+.env.*.local
+*.pfx
+*.key
+*.pem
+secrets.json
+
+# Bicep / ARM のビルド成果物
+main.json
+*.compiled.json
+azuredeploy.json
+
+# Terraform（Terraform 版を併用する場合）
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+.terraform.lock.hcl
+crash.log
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+
+# エディタ
+.vscode/
+!.vscode/extensions.json
+.idea/
+*.swp
+*~
+
+# ログ・一時ファイル
+*.log
+tmp/
+temp/
+.tmp/
+
+# Python（スクリプト用）
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# Node
+node_modules/
+
+# 作業用
+scratch/
+_local/
