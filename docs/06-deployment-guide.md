@@ -662,6 +662,41 @@ az consumption budget create `
 
 ## 削除
 
+### 推奨: 付属スクリプトを使う
+
+閉域構成の `azd down` は **2 段階で必ず失敗します**（詳細は後述）。
+本リポジトリには正しい順序で片付けるスクリプトを同梱しています。
+
+```powershell
+.\scripts\Remove-Deployment.ps1
+```
+
+以下を自動で行います。
+
+| 手順 | 内容 | 回避する障害 |
+|---|---|---|
+| 1 | AMPLS のスコープリンクを解除 | `CannotDeleteWorkspaceWhenLinkedToPrivateLinkScopes` |
+| 2 | ACA 環境を先に削除（SAL の回収を早く始めさせる） | `InUseSubnetCannotBeDeleted` |
+| 3 | AI Search の SPL を削除 → Search 本体を削除 | `LockedSPLResourceFound` |
+| 4 | `azd down --force --purge` | — |
+| 5 | NAT Gateway を切り離して削除（**課金停止**） | VNet 残存時の約 $35/月 |
+| 6 | 孤児 Service Association Link の自動回収を待機 | `ResourceGroupDeletionBlocked` |
+| 7 | リソースグループを削除 | — |
+| 8 | Key Vault / App Config / Foundry の論理削除を purge | `NameUnavailable` での再デプロイ失敗 |
+
+```powershell
+# azd down が既に失敗した後のリカバリ
+.\scripts\Remove-Deployment.ps1 -ResourceGroup rg-ailz-full -SkipAzdDown
+
+# SAL の回収を待たず、課金だけ止めて抜ける（後で RG 削除を再実行）
+.\scripts\Remove-Deployment.ps1 -SalTimeoutMinutes 0
+
+# 実行内容の事前確認
+.\scripts\Remove-Deployment.ps1 -WhatIf
+```
+
+### 手動で行う場合
+
 ```powershell
 cd infra-upstream
 azd down --force --purge
@@ -669,6 +704,10 @@ azd down --force --purge
 
 **`--purge` は必須です。** これがないと Key Vault / App Configuration / Cognitive Services が
 論理削除状態で残り、同じ名前で再デプロイできません。
+
+> [!WARNING]
+> 閉域構成では、この 1 コマンドだけでは**必ず失敗します。**
+> 以下の 2 つの障害を順に解消する必要があります。
 
 ### `CannotDeleteWorkspaceWhenLinkedToPrivateLinkScopes` で失敗する場合（閉域構成では必ず発生）
 
@@ -846,6 +885,9 @@ az cognitiveservices account list-deleted --query "[].name" -o tsv
 
 ### 論理削除が残ってしまった場合
 
+`azd down` が RG 削除で失敗すると `--purge` が最後まで走らないため、
+論理削除の残骸が残ります。**残っていると同じ名前で再デプロイできません。**
+
 ```powershell
 # Key Vault
 az keyvault list-deleted --query "[].name" -o tsv
@@ -859,6 +901,19 @@ az appconfig purge --name <name> --yes
 az cognitiveservices account list-deleted --query "[].{name:name, location:location, rg:resourceGroup}" -o table
 az cognitiveservices account purge --name <name> --location <location> --resource-group <rg>
 ```
+
+> [!NOTE]
+> Foundry の purge がアカウント削除直後に失敗することがあります。
+>
+> ```
+> ERROR: Conflict({"error":{"code":"RequestConflict","message":
+> "Cannot modify resource with id '.../accounts/aif-xxxxx' because the resource entity
+> provisioning state is not terminal. Please wait for the provisioning state to become
+> terminal and then retry the request."}})
+> ```
+>
+> 削除処理がまだ進行中というだけなので、**数分おいて同じコマンドを再実行**すれば通ります。
+> `az rest` で `deletedAccounts` を直接 DELETE しても同じエラーになります。
 
 ---
 

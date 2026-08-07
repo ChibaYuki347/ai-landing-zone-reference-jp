@@ -81,9 +81,15 @@ cd ..
 .\scripts\Test-Deployment.ps1
 
 # 6. 削除（重要）
-cd infra-upstream
-azd down --force --purge
+.\scripts\Remove-Deployment.ps1
 ```
+
+> [!WARNING]
+> 閉域構成（`secure` / `full`）では **`azd down --force --purge` だけでは必ず失敗します。**
+> AMPLS のスコープリンク、AI Search の Shared Private Link Resource、
+> Container Apps の Service Association Link を正しい順序で片付ける必要があるため、
+> 同梱の `Remove-Deployment.ps1` を使ってください。
+> 詳細は [デプロイガイド - 削除](docs/06-deployment-guide.md#削除) に記載しています。
 
 ### プリセット早見表
 
@@ -183,7 +189,8 @@ ai-landing-zone-reference-jp/
 │   └── full.env                   #   Firewall 込み（~US$1,715/月）
 ├── scripts/
 │   ├── Set-Preset.ps1             # プリセットを azd 環境に適用
-│   └── Test-Deployment.ps1        # デプロイ結果の検証
+│   ├── Test-Deployment.ps1        # デプロイ結果の検証
+│   └── Remove-Deployment.ps1      # 閉域構成を正しい順序で削除
 └── infra-upstream/                # 公式 Bicep 実装 v2.4.1 同梱
     ├── main.bicep
     ├── main.parameters.json       #   158 パラメータ
