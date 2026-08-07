@@ -126,6 +126,7 @@ cd ..
 | Private DNS Zone | 15（VNet リンク 15） |
 | デプロイ時間 | **20 分 39 秒**（差分デプロイ）／ 初回フルは約 70 分 |
 | モデル | `gpt-5-nano` (GlobalStandard 40) / `text-embedding-3-large` (Standard 10) |
+| **削除時間** | **約 2 時間**（うち約 1 時間は ACA の Service Association Link 自動回収待ち） |
 
 ### Zero Trust の実証結果
 
@@ -155,7 +156,12 @@ cd ..
 | `azd down --force --purge` が `CannotDeleteWorkspaceWhenLinkedToPrivateLinkScopes` (409) | 閉域構成では Log Analytics / App Insights が AMPLS に紐づく。**スコープリンクを解除してから再実行**（purge 段階の失敗なのでリソースは未削除） |
 | その後 `azd down` が `ResourceGroupDeletionBlocked`（**91 → 6 個で停止**） | RG 削除は依存関係を無視して並列削除するため。下記 2 つを個別に片付ける |
 | AI Search が `LockedSPLResourceFound` | Shared Private Link Resource が 4 件残存（接続先が消えて `Disconnected` でも削除をブロック）。SPL を全削除してから Search を削除 |
-| VNet が `InUseSubnetCannotBeDeleted`（`legionservicelink`） | ACA 環境の孤児 Service Association Link。委任と SAL が相互ロックし **手動解除は一切不可**（SAL の削除は `Microsoft.App` RP のみ許可）。30 分〜数時間で自動回収されるので待って再実行 |
+| VNet が `InUseSubnetCannotBeDeleted`（`legionservicelink`） | ACA 環境の孤児 Service Association Link。委任と SAL が相互ロックし **手動解除は一切不可**（SAL の削除は `Microsoft.App` RP のみ許可）。**実測約 1 時間**で自動回収される |
+| Foundry の purge が `RequestConflict` | Cognitive Services の削除処理が未完了。**RG 削除後も継続し実測 30 分以上**。48 時間で自動消滅 |
+
+> [!TIP]
+> 削除まわりの障害はすべて **`scripts/Remove-Deployment.ps1`** が自動で処理します。
+> 上表の6件は同スクリプトで解消済みであることを実機で確認しています。
 
 詳細な切り分け手順とコマンドは
 **[デプロイガイド - Japan East の既知の制約](docs/06-deployment-guide.md)** に記載しています。

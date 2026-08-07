@@ -828,7 +828,8 @@ ACA 環境を削除してもこの SAL は**非同期にクリーンアップ**�
 
 **対処: 時間をおいて再実行します。**
 `Microsoft.App` RP がバックグラウンドで SAL を回収するため、
-通常 **30 分〜数時間**で自動的に消えます。
+放置しておけば自動的に消えます。**実測では約 1 時間**で解消しました。
+（`Remove-Deployment.ps1` はこの待機と再削除を自動で行います）
 
 ```powershell
 # SAL が残っているか確認
@@ -912,8 +913,22 @@ az cognitiveservices account purge --name <name> --location <location> --resourc
 > terminal and then retry the request."}})
 > ```
 >
-> 削除処理がまだ進行中というだけなので、**数分おいて同じコマンドを再実行**すれば通ります。
-> `az rest` で `deletedAccounts` を直接 DELETE しても同じエラーになります。
+> **リソースグループを削除した後でもこのエラーは続きます。**
+> Cognitive Services 側の内部的な削除処理が終わるまで purge を受け付けないためで、
+> 実測では 30 分以上かかりました。`az rest` で `deletedAccounts` を直接 DELETE しても同じです。
+>
+> 急がない場合は放置して構いません。**論理削除は 48 時間で自動的に消滅します。**
+> 同じ名前ですぐ再デプロイしたい場合のみ、以下のように定期的にリトライしてください。
+>
+> ```powershell
+> while ($true) {
+>     $left = az cognitiveservices account list-deleted --query "[].name" -o tsv
+>     if (-not $left) { "purge 完了"; break }
+>     az cognitiveservices account purge --name <name> --location <location> --resource-group <rg>
+>     if ($LASTEXITCODE -eq 0) { "purge 完了"; break }
+>     Start-Sleep -Seconds 300
+> }
+> ```
 
 ---
 
@@ -926,7 +941,8 @@ az cognitiveservices account purge --name <name> --location <location> --resourc
 | `azd down` が `CannotDeleteWorkspaceWhenLinkedToPrivateLinkScopes` (409) | 閉域構成では Log Analytics / App Insights が AMPLS に紐づく。**purge 段階の失敗なのでリソースは未削除。** [削除](#削除)節の手順でスコープリンクを解除してから再実行 |
 | `azd down` が `ResourceGroupDeletionBlocked` | RG 削除は並列削除なので依存関係で止まる。実測 91 → 6 個で停止。[削除](#resourcegroupdeletionblocked-で失敗する場合閉域構成では必ず発生)節を参照 |
 | Search が `LockedSPLResourceFound` で削除できない | Shared Private Link Resource が残存。`az search shared-private-link-resource delete` で 4 件すべて削除してから Search を削除 |
-| VNet が `InUseSubnetCannotBeDeleted`（`legionservicelink`） | ACA 環境の孤児 Service Association Link。**手動解除は不可**（委任と SAL が相互ロック）。30 分〜数時間で自動回収されるので待って再実行 |
+| VNet が `InUseSubnetCannotBeDeleted`（`legionservicelink`） | ACA 環境の孤児 Service Association Link。**手動解除は不可**（委任と SAL が相互ロック）。実測約 1 時間で自動回収されるので待って再実行。`Remove-Deployment.ps1` が自動で待機する |
+| Foundry の purge が `RequestConflict`（`provisioning state is not terminal`） | Cognitive Services 側の削除処理が未完了。**RG 削除後も継続し、実測 30 分以上**かかる。48 時間で自動消滅するので、同名で再デプロイしない限り放置可 |
 | `Login expired` がデプロイ中に発生 | `azd auth login` 後に `azd provision` を再実行。ARM デプロイはサーバ側で継続中 |
 | Container App が 502 | イメージ pull 失敗。`az containerapp logs show -g $rg -n <ca>`。Firewall の `AllowMicrosoftContainerRegistry` ルールを確認 |
 | Jumpbox の CSE が失敗 | ポータル → VM → 拡張機能 → `AzureCustomScriptExtension` でエラー確認。Firewall の FQDN 許可リスト不足が多い |
